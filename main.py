@@ -104,6 +104,16 @@ class Database:
                 return LibsqlCursorWrapper(rs)
             except Exception as e:
                 print(f"Tursoクエリエラー: {e}", flush=True)
+                # サーバー切断エラーの場合、次回再接続するために共有クライアントを破棄
+                if "disconnected" in str(e).lower() or "closed" in str(e).lower():
+                    global _turso_shared_client
+                    if _turso_shared_client is not None:
+                        try:
+                            await _turso_shared_client.close()
+                        except:
+                            pass
+                        _turso_shared_client = None
+                    print("Tursoへの接続が切断されました。クライアントをリセットし、次回再接続します。", flush=True)
                 raise e
         else:
             return await self._conn.execute(sql, params)
