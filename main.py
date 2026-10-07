@@ -28,9 +28,11 @@ TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
 raw_turso_url = (os.getenv("TURSO_DATABASE_URL") or "").strip().strip("'\"")
 raw_turso_token = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
 
-# URLのプロトコルは変更せず、そのまま利用する (libsql:// によるWebSocket通信が最も安定するため)
+# URLのプロトコルを安全な https:// 形式に正規化 (WebSocket 400エラー防止)
 if raw_turso_url:
-    TURSO_DATABASE_URL = raw_turso_url
+    TURSO_DATABASE_URL = re.sub(r"^(libsql|wss|http)://", "https://", raw_turso_url)
+    if not TURSO_DATABASE_URL.startswith("https://"):
+        TURSO_DATABASE_URL = "https://" + TURSO_DATABASE_URL
 else:
     TURSO_DATABASE_URL = None
 
@@ -767,7 +769,8 @@ class CircleManagerBot(commands.Bot):
                     await msg.edit(embed=embed)
 
         except Exception as e:
-            logging.getLogger("discord").error(f"Error in update_attendance_panels: {e}")
+            if "disconnected" not in str(e).lower() and "closed" not in str(e).lower():
+                logging.getLogger("discord").error(f"Error in update_attendance_panels: {e}")
 
     @update_attendance_panels.before_loop
     async def before_update_attendance(self):
@@ -818,7 +821,8 @@ class CircleManagerBot(commands.Bot):
                     await msg.edit(embed=embed, view=view)
 
         except Exception as e:
-            logging.getLogger("discord").error(f"Error in update_room_panels: {e}")
+            if "disconnected" not in str(e).lower() and "closed" not in str(e).lower():
+                logging.getLogger("discord").error(f"Error in update_room_panels: {e}")
 
     @update_room_panels.before_loop
     async def before_update_rooms(self):
