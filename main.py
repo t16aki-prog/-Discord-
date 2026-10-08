@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import time
+import threading
 import aiohttp
 from aiohttp import web
 
@@ -215,8 +216,8 @@ async def get_guild_settings(guild_id: int):
 
 # --- Render スリープ防止用 Keep-Alive Webサーバー ---
 
-async def start_web_server():
-    """Renderのポート開放用ダミーWebサーバー"""
+def run_keep_alive_server():
+    """Renderのポート開放用ダミーWebサーバー（バックグラウンドスレッドで即時起動）"""
     app = web.Application()
 
     async def handle_ping(request):
@@ -226,14 +227,24 @@ async def start_web_server():
     app.router.add_get("/health", handle_ping)
 
     port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+
     try:
-        await site.start()
-        print(f"Keep-Alive Webサーバー起動完了 (ポート: {port})", flush=True)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        runner = web.AppRunner(app)
+        loop.run_until_complete(runner.setup())
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        loop.run_until_complete(site.start())
+        print(f"Keep-Alive Webサーバー即時起動完了 (ポート: {port})", flush=True)
+        loop.run_forever()
     except Exception as e:
-        print(f"Webサーバーの起動スキップ: {e}", flush=True)
+        print(f"Webサーバーの起動スキップまたはエラー: {e}", flush=True)
+
+
+def start_web_server_thread():
+    """別スレッドでWebサーバーを立ち上げ、ポートを0.1秒で即座に開放する"""
+    t = threading.Thread(target=run_keep_alive_server, daemon=True)
+    t.start()
 
 
 # --- UI コンポーネント (Persistent Views & Modals) ---
@@ -701,7 +712,6 @@ class CircleManagerBot(commands.Bot):
 
     async def setup_hook(self):
         await init_db()
-        asyncio.create_task(start_web_server())
 
         # 永続Viewの登録（再起動後もボタンが機能するよう）
         self.add_view(AdminPanelView())
@@ -932,6 +942,9 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
     print("Botの起動処理を開始します...", flush=True)
+
+    # Renderのヘルスチェック（ポートリッスン）を通すため、即座にWebサーバーを別スレッドで開始
+    start_web_server_thread()
 
     if not TOKEN:
         print("エラー: .env ファイルに DISCORD_TOKEN または DISCORD_BOT_TOKEN が設定されていません。", flush=True)
