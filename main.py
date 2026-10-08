@@ -10,6 +10,7 @@ import asyncio
 from dotenv import load_dotenv
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import aiohttp
 from aiohttp import web
 
 # Windowsコンソールでの文字化け・UnicodeEncodeError対策
@@ -693,12 +694,12 @@ class CircleManagerBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.guild_scheduled_events = True
+        intents.message_content = True  # !sync コマンド用
         super().__init__(command_prefix="!", intents=intents)
-        self._ensured_guild_ids = set()
+        self._ready_once = False
 
     async def setup_hook(self):
         await init_db()
-        asyncio.create_task(start_web_server())
 
         # 永続Viewの登録（再起動後もボタンが機能するよう）
         self.add_view(AdminPanelView())
@@ -719,26 +720,34 @@ class CircleManagerBot(commands.Bot):
         except Exception as e:
             logging.getLogger("discord").error(f"部屋パネルViewの初期化エラー: {e}")
 
-        # スラッシュコマンドの同期（レートリミット等の例外でBotが落ちないよう保護）
-        try:
-            synced = await self.tree.sync()
-            print(f"スラッシュコマンドを {len(synced)} 件同期しました。", flush=True)
-        except Exception as e:
-            print(f"スラッシュコマンド同期スキップ（一時制限またはエラー）: {e}", flush=True)
+        # スラッシュコマンド同期（環境変数 SYNC_COMMANDS=true の時のみ実行してレートリミットを防止）
+        should_sync = os.getenv("SYNC_COMMANDS", "false").lower() in ("true", "1")
+        if should_sync:
+            try:
+                synced = await self.tree.sync()
+                print(f"スラッシュコマンドを {len(synced)} 件同期しました。", flush=True)
+            except Exception as e:
+                print(f"スラッシュコマンド同期スキップ（一時制限またはエラー）: {e}", flush=True)
+        else:
+            print("スラッシュコマンド同期はスキップされました（手動同期: チャットで !sync を実行するか SYNC_COMMANDS=true を設定）", flush=True)
 
         # 過去イベントの定期クリーンアップタスク開始（10分おき）
-        self.cleanup_past_events.start()
+        if not self.cleanup_past_events.is_running():
+            self.cleanup_past_events.start()
 
     async def on_ready(self):
         logger = logging.getLogger("discord")
+        if self._ready_once:
+            logger.info(f"Botセッション再接続完了: {self.user}")
+            return
+        self._ready_once = True
+
         logger.info("========================================")
         logger.info(f"Botログイン成功: {self.user} (ID: {self.user.id})")
         logger.info(f"参加中のサーバー数: {len(self.guilds)}")
         for guild in self.guilds:
             logger.info(f"   - {guild.name} (ID: {guild.id})")
         logger.info("========================================")
-        for guild in self.guilds:
-            await self._ensure_admin_panel(guild)
 
     async def on_guild_join(self, guild: discord.Guild):
         """新しいサーバーに参加したときセットアップを促すメッセージを送る"""
@@ -773,9 +782,7 @@ class CircleManagerBot(commands.Bot):
                 logger.error(f"ウェルカムメッセージ送信失敗 ({guild.name}): {e}")
 
     async def _ensure_admin_panel(self, guild: discord.Guild):
-        """指定サーバーの管理チャンネルに管理パネルが存在しなければ自動設置する"""
-        if guild.id in self._ensured_guild_ids:
-            return
+        """指定サーバーの管理チャンネルに管理パネルが存在しなければ設置する"""
         logger = logging.getLogger("discord")
         settings = await get_guild_settings(guild.id)
         if not settings or not settings.get("admin_channel_id"):
@@ -802,7 +809,6 @@ class CircleManagerBot(commands.Bot):
                 )
                 await admin_channel.send(embed=embed, view=AdminPanelView())
                 logger.info(f"[{guild.name}] 管理パネルを設置しました。")
-            self._ensured_guild_ids.add(guild.id)
         except Exception as e:
             logger.error(f"[{guild.name}] 管理パネル確認・送信失敗: {e}")
 
@@ -847,6 +853,18 @@ class CircleManagerBot(commands.Bot):
 # --- Bot インスタンスとスラッシュコマンド ---
 
 bot = CircleManagerBot()
+
+
+@bot.command(name="sync")
+@commands.has_permissions(administrator=True)
+async def sync_commands(ctx: commands.Context):
+    """管理者用: スラッシュコマンドを手動で同期する (!sync)"""
+    try:
+        msg = await ctx.send("スラッシュコマンドを同期中...")
+        synced = await bot.tree.sync()
+        await msg.edit(content=f"✅ スラッシュコマンドを {len(synced)} 件同期しました！")
+    except Exception as e:
+        await ctx.send(f"❌ 同期エラー: {e}")
 
 
 @bot.tree.command(name="setup", description="【管理者専用】このBotで使用するチャンネルを設定します")
@@ -907,12 +925,58 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
         await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
 
 
-# エントリーポイント
+# --- 指数バックオフ付きメインエントリーポイント ---
+
+async def main():
+    # 1. ヘルスチェック用Webサーバーを最優先で起動 (Renderのヘルスチェック死・クラッシュループを防ぐ)
+    await start_web_server()
+
+    if not TOKEN:
+        print("エラー: .env ファイルに DISCORD_TOKEN または DISCORD_BOT_TOKEN が設定されていません。", flush=True)
+        return
+
+    # 2. 指数バックオフ付きの接続リトライループ
+    initial_backoff = 30    # 初期待機: 30秒
+    max_backoff = 300       # 最大待機: 300秒 (5分)
+    backoff = initial_backoff
+
+    while True:
+        try:
+            print("Discordサーバーへ接続中...", flush=True)
+            await bot.start(TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                print(
+                    f"⚠️ [Rate Limited / 429 / Cloudflare Error 1015] レートリミットを検知しました。\n"
+                    f"   ブロック解除のため {backoff} 秒間リクエストを完全に停止して待機します。\n"
+                    f"   詳細: {e}",
+                    flush=True,
+                )
+            else:
+                print(f"⚠️ [HTTP {e.status}] HTTPエラーが発生しました: {e}。{backoff}秒待機します。", flush=True)
+        except (discord.errors.GatewayNotFound, discord.errors.ConnectionClosed, aiohttp.ClientError, OSError) as e:
+            print(f"⚠️ [Network Error] 接続エラーが発生しました: {e}。{backoff}秒待機します。", flush=True)
+        except Exception as e:
+            print(f"⚠️ [Unexpected Error] 予期せぬエラーが発生しました: {e}。{backoff}秒待機します。", flush=True)
+        finally:
+            if not bot.is_closed():
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+
+        print(
+            f"🔄 クールダウン待機中 ({backoff}秒)... (Webサーバーは稼働中のためRenderによる強制再起動は防がれます)",
+            flush=True,
+        )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
     print("Botの起動処理を開始します...", flush=True)
-    if not TOKEN:
-        print("エラー: .env ファイルに DISCORD_TOKEN または DISCORD_BOT_TOKEN が設定されていません。", flush=True)
-    else:
-        print("トークンを読み込みました。Discordサーバーへ接続中...", flush=True)
-        bot.run(TOKEN)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Botを停止しました。", flush=True)
