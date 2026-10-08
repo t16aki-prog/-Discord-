@@ -247,6 +247,69 @@ def start_web_server_thread():
     t.start()
 
 
+# --- 自己防衛型サーキットブレーカー (過剰リクエスト事前遮断 & 緊急停止システム) ---
+
+class RequestCircuitBreaker:
+    """Discord APIへの過剰通信（連打・ループ）を瞬時に検知し、API送信前に事前遮断するクラス"""
+    def __init__(self, max_requests: int = 15, window_seconds: float = 5.0, cooldown_seconds: float = 60.0):
+        self.max_requests = max_requests  # 5秒間に最大15リクエストまで許可
+        self.window_seconds = window_seconds
+        self.cooldown_seconds = cooldown_seconds
+        self._timestamps = []
+        self._lock = asyncio.Lock()
+        self.is_tripped = False
+        self.tripped_until = 0.0
+        self.maintenance_mode = False
+
+    async def can_proceed(self) -> bool:
+        """リクエスト・操作実行前に呼び出し、通信を許可するか事前遮断するか判定する"""
+        if self.maintenance_mode:
+            return False
+
+        now = time.time()
+        async with self._lock:
+            # 遮断中かチェック
+            if self.is_tripped:
+                if now < self.tripped_until:
+                    return False
+                else:
+                    self.is_tripped = False
+                    self._timestamps.clear()
+                    print("🛡️ [Circuit Breaker] クールダウン完了: 通常稼働に自動復帰しました。", flush=True)
+
+            # 古いタイムスタンプをスライディングウィンドウから除外
+            cutoff = now - self.window_seconds
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+            # 閾値超過判定 (短時間の過剰リクエストを事前検知)
+            if len(self._timestamps) >= self.max_requests:
+                self.is_tripped = True
+                self.tripped_until = now + self.cooldown_seconds
+                print(
+                    f"🚨 [Circuit Breaker 発動] 短時間に過剰なリクエスト ({len(self._timestamps)}回 / {self.window_seconds}秒) を検知！\n"
+                    f"   Cloudflare/DiscordによるIPブロックを防ぐため、{self.cooldown_seconds}秒間リクエストを事前遮断します。",
+                    flush=True,
+                )
+                return False
+
+            self._timestamps.append(now)
+            return True
+
+    def trip_manually(self, reason: str = "手動"):
+        self.is_tripped = True
+        self.tripped_until = time.time() + self.cooldown_seconds
+        print(f"🚨 [Circuit Breaker 手動発動] 理由: {reason} ({self.cooldown_seconds}秒遮断)", flush=True)
+
+    def reset(self):
+        self.is_tripped = False
+        self._timestamps.clear()
+        self.tripped_until = 0.0
+        print("🛡️ [Circuit Breaker] 手動でリセットされました。", flush=True)
+
+
+circuit_breaker = RequestCircuitBreaker()
+
+
 # --- UI コンポーネント (Persistent Views & Modals) ---
 
 class AttendanceView(discord.ui.View):
@@ -710,6 +773,22 @@ class CircleManagerBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self._ready_once = False
 
+    async def on_interaction(self, interaction: discord.Interaction):
+        """ユーザー操作（ボタン・コマンド等）を受信した際、API送信前に過剰リクエストを瞬時検知・遮断する"""
+        if not await circuit_breaker.can_proceed():
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "🛡️ **システム保護モード (Circuit Breaker)**\n"
+                        "短時間の過剰アクセスを検知したため、Cloudflare / Discord によるIPブロックを防ぐ目的で一時的に操作を制限しています。\n"
+                        "約1分後に再度お試しください。",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+            return
+        await super().on_interaction(interaction)
+
     async def setup_hook(self):
         await init_db()
 
@@ -877,6 +956,56 @@ async def sync_commands(ctx: commands.Context):
         await msg.edit(content=f"✅ スラッシュコマンドを {len(synced)} 件同期しました！")
     except Exception as e:
         await ctx.send(f"❌ 同期エラー: {e}")
+
+
+@bot.command(name="shutdown", aliases=["stop", "kill"])
+@commands.has_permissions(administrator=True)
+async def shutdown_command(ctx: commands.Context):
+    """管理者用: Botを安全に緊急停止する (!shutdown)"""
+    await ctx.send("🚨 **緊急停止コマンドを受信しました。**\nDiscordとの接続を安全に切断してシャットダウンします...")
+    logging.getLogger("discord").warning(f"緊急停止コマンドが実行されました (実行者: {ctx.author})")
+    await bot.close()
+
+
+@bot.command(name="maintenance")
+@commands.has_permissions(administrator=True)
+async def maintenance_command(ctx: commands.Context, state: str = ""):
+    """管理者用: メンテナンスモードの切替 (!maintenance on / !maintenance off)"""
+    if state.lower() in ("on", "enable", "1"):
+        circuit_breaker.maintenance_mode = True
+        await ctx.send("🛠️ **メンテナンスモードを【有効】にしました。**\n一般ユーザーのコマンドやボタン操作を一時停止します。")
+    elif state.lower() in ("off", "disable", "0"):
+        circuit_breaker.maintenance_mode = False
+        circuit_breaker.reset()
+        await ctx.send("✅ **メンテナンスモードを【無効】にしました。**\n通常のBot操作を再開します。")
+    else:
+        current_status = "🛠️ 有効（操作停止中）" if circuit_breaker.maintenance_mode else "🟢 無効（通常稼働）"
+        await ctx.send(
+            f"現在のメンテナンスモード: **{current_status}**\n"
+            f"切り替え方法: `!maintenance on` または `!maintenance off`"
+        )
+
+
+@bot.command(name="status")
+@commands.has_permissions(administrator=True)
+async def status_command(ctx: commands.Context):
+    """管理者用: Botとサーキットブレーカーの稼働状態を表示 (!status)"""
+    is_tripped = circuit_breaker.is_tripped
+    m_mode = circuit_breaker.maintenance_mode
+    remaining = max(0, int(circuit_breaker.tripped_until - time.time())) if is_tripped else 0
+
+    embed = discord.Embed(
+        title="🛡️ Botシステム防衛ステータス",
+        color=discord.Color.red() if (is_tripped or m_mode) else discord.Color.green(),
+    )
+    embed.add_field(
+        name="サーキットブレーカー",
+        value=f"⚠️ **過剰リクエスト遮断中**\n(自動復旧まで残り {remaining} 秒)" if is_tripped else "🟢 **正常** (リクエスト監視中)",
+        inline=False,
+    )
+    embed.add_field(name="メンテナンスモード", value="🛠️ **有効 (停止中)**" if m_mode else "🟢 **無効 (稼働中)**", inline=True)
+    embed.add_field(name="直近リクエスト頻度", value=f"**{len(circuit_breaker._timestamps)}** 件 / 5秒", inline=True)
+    await ctx.send(embed=embed)
 
 
 @bot.tree.command(name="setup", description="【管理者専用】このBotで使用するチャンネルを設定します")
