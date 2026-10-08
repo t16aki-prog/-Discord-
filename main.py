@@ -241,24 +241,32 @@ class AttendanceView(discord.ui.View):
         try:
             async with Database.connect() as db:
                 async with await db.execute(
-                    "SELECT event_date FROM events WHERE message_id = ?", (interaction.message.id,)
+                    "SELECT name, date, event_date FROM events WHERE message_id = ?", (interaction.message.id,)
                 ) as cursor:
-                    row = await cursor.fetchone()
-                    if row and row[0]:
-                        event_date = row[0]
-                        if today_str < event_date:
-                            await interaction.followup.send(
-                                f"このイベント（{event_date}）はまだ開催日ではありません。当日になってから登録してください。",
-                                ephemeral=True,
-                            )
-                            return
-                        elif today_str > event_date:
-                            await interaction.message.delete()
-                            await interaction.followup.send(
-                                f"このイベント（{event_date}）は過去のイベントのため、古いパネルを削除しました。",
-                                ephemeral=True,
-                            )
-                            return
+                    event_row = await cursor.fetchone()
+
+                if not event_row:
+                    await interaction.followup.send("イベントが見つかりませんでした。", ephemeral=True)
+                    return
+
+                event_name, date_str, event_date = event_row
+
+                if event_date and today_str < event_date:
+                    await interaction.followup.send(
+                        f"このイベント（{event_date}）はまだ開催日ではありません。当日になってから登録してください。",
+                        ephemeral=True,
+                    )
+                    return
+                elif event_date and today_str > event_date:
+                    try:
+                        await interaction.message.delete()
+                    except Exception:
+                        pass
+                    await interaction.followup.send(
+                        f"このイベント（{event_date}）は過去のイベントのため、古いパネルを削除しました。",
+                        ephemeral=True,
+                    )
+                    return
 
                 await db.execute(
                     """
@@ -269,8 +277,29 @@ class AttendanceView(discord.ui.View):
                     (interaction.message.id, interaction.user.id, interaction.user.display_name, status),
                 )
                 await db.commit()
+
+                async with await db.execute(
+                    "SELECT user_name, status FROM attendances WHERE message_id = ?", (interaction.message.id,)
+                ) as att_cursor:
+                    attendances = await att_cursor.fetchall()
+
+            att_yes = [a[0] for a in attendances if a[1] == "出席"]
+            att_no = [a[0] for a in attendances if a[1] == "欠席"]
+            att_maybe = [a[0] for a in attendances if a[1] == "遅刻/未定"]
+
+            if event_date is None:
+                desc = f"**日時:** {date_str}\n\n下のボタンから出欠を入力してください！\n\n"
+            else:
+                desc = f"**日時:** {date_str}\n\n下のボタンから出欠を入力してください！\n※開催日({event_date})になるまで登録できません。\n\n"
+
+            desc += f"**【出席】 ({len(att_yes)}名)**\n" + (", ".join(att_yes) if att_yes else "なし") + "\n\n"
+            desc += f"**【欠席】 ({len(att_no)}名)**\n" + (", ".join(att_no) if att_no else "なし") + "\n\n"
+            desc += f"**【遅刻/未定】 ({len(att_maybe)}名)**\n" + (", ".join(att_maybe) if att_maybe else "なし")
+
+            embed = discord.Embed(title=f"📅 {event_name}", description=desc, color=discord.Color.blue())
+            await interaction.message.edit(embed=embed)
             await interaction.followup.send(
-                f"あなたの出欠を「{status}」で登録しました！\n※一覧への反映には数秒かかる場合があります。",
+                f"あなたの出欠を「{status}」で登録しました！",
                 ephemeral=True,
             )
         except Exception as e:
@@ -338,9 +367,26 @@ class RoomStatusSelect(discord.ui.Select):
                             (new_status, now, guild_id, room_name),
                         )
                         await db.commit()
+
+                        async with await db.execute(
+                            "SELECT name, is_open, last_updated FROM rooms WHERE guild_id = ? ORDER BY name", (guild_id,)
+                        ) as room_cursor:
+                            rooms = await room_cursor.fetchall()
+
+                        desc = ""
+                        for r in rooms:
+                            rname, is_open_val, last_up = r
+                            status_emoji = "🟢" if is_open_val else "🔴"
+                            status_text_val = "開放中" if is_open_val else "施錠中"
+                            desc += f"{status_emoji} **{rname}** : {status_text_val} (更新: {last_up})\n"
+
+                        embed = discord.Embed(title="🏢 部室・施設の利用状況", description=desc, color=discord.Color.green())
+                        view = RoomStatusView(rooms)
+                        await interaction.message.edit(embed=embed, view=view)
+
                         status_text = "開放" if new_status == 1 else "施錠"
                         await interaction.response.send_message(
-                            f"「{room_name}」を【{status_text}】に変更しました！\n※一覧への反映には数秒かかる場合があります。",
+                            f"「{room_name}」を【{status_text}】に変更しました！",
                             ephemeral=True,
                         )
                     else:
@@ -621,9 +667,8 @@ class CircleManagerBot(commands.Bot):
         synced = await self.tree.sync()
         print(f"スラッシュコマンドを {len(synced)} 件同期しました。", flush=True)
 
-        # 定期更新タスクの開始
-        self.update_attendance_panels.start()
-        self.update_room_panels.start()
+        # 過去イベントの定期クリーンアップタスク開始（10分おき）
+        self.cleanup_past_events.start()
 
     async def on_ready(self):
         logger = logging.getLogger("discord")
@@ -699,133 +744,41 @@ class CircleManagerBot(commands.Bot):
             except Exception as e:
                 logger.error(f"[{guild.name}] 管理パネル送信失敗: {e}")
 
-    @tasks.loop(seconds=5.0)
-    async def update_attendance_panels(self):
-        """出欠パネルのバッチ更新（全サーバー対応）"""
+    @tasks.loop(minutes=10.0)
+    async def cleanup_past_events(self):
+        """過去イベントの定期クリーンアップ（10分おきの低負荷メンテナンス）"""
         try:
             today_str = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
             async with Database.connect() as db:
                 async with await db.execute(
-                    "SELECT message_id, guild_id, name, date, event_date FROM events"
+                    "SELECT message_id, guild_id, event_date FROM events WHERE event_date IS NOT NULL AND event_date < ?",
+                    (today_str,)
                 ) as event_cursor:
-                    events = await event_cursor.fetchall()
+                    past_events = await event_cursor.fetchall()
 
-            for event in events:
-                msg_id, guild_id, name, date, event_date = event
+            for msg_id, guild_id, event_date in past_events:
                 if guild_id is None:
                     continue
                 settings = await get_guild_settings(guild_id)
-                if not settings or not settings.get("attendance_channel_id"):
-                    continue
-                attendance_channel = self.get_channel(settings["attendance_channel_id"])
-                if not attendance_channel:
-                    continue
-
-                if event_date is not None and event_date < today_str:
-                    try:
-                        msg = await attendance_channel.fetch_message(msg_id)
-                        await msg.delete()
-                    except Exception:
-                        pass
-                    async with Database.connect() as db:
-                        await db.execute("DELETE FROM events WHERE message_id = ?", (msg_id,))
-                        await db.execute("DELETE FROM attendances WHERE message_id = ?", (msg_id,))
-                        await db.commit()
-                    continue
-
-                try:
-                    msg = await attendance_channel.fetch_message(msg_id)
-                except discord.NotFound:
-                    async with Database.connect() as db:
-                        await db.execute("DELETE FROM events WHERE message_id = ?", (msg_id,))
-                        await db.execute("DELETE FROM attendances WHERE message_id = ?", (msg_id,))
-                        await db.commit()
-                    continue
-                except discord.HTTPException:
-                    continue
-
+                if settings and settings.get("attendance_channel_id"):
+                    channel = self.get_channel(settings["attendance_channel_id"])
+                    if channel:
+                        try:
+                            msg = await channel.fetch_message(msg_id)
+                            await msg.delete()
+                        except Exception:
+                            pass
                 async with Database.connect() as db:
-                    async with await db.execute(
-                        "SELECT user_name, status FROM attendances WHERE message_id = ?", (msg_id,)
-                    ) as att_cursor:
-                        attendances = await att_cursor.fetchall()
-
-                att_yes = [a[0] for a in attendances if a[1] == "出席"]
-                att_no = [a[0] for a in attendances if a[1] == "欠席"]
-                att_maybe = [a[0] for a in attendances if a[1] == "遅刻/未定"]
-
-                if event_date is None:
-                    desc = f"**日時:** {date}\n\n下のボタンから出欠を入力してください！\n\n"
-                else:
-                    desc = f"**日時:** {date}\n\n下のボタンから出欠を入力してください！\n※開催日({event_date})になるまで登録できません。\n\n"
-
-                desc += f"**【出席】 ({len(att_yes)}名)**\n" + (", ".join(att_yes) if att_yes else "なし") + "\n\n"
-                desc += f"**【欠席】 ({len(att_no)}名)**\n" + (", ".join(att_no) if att_no else "なし") + "\n\n"
-                desc += f"**【遅刻/未定】 ({len(att_maybe)}名)**\n" + (", ".join(att_maybe) if att_maybe else "なし")
-
-                current_desc = msg.embeds[0].description if msg.embeds else ""
-                if current_desc != desc:
-                    embed = discord.Embed(title=f"📅 {name}", description=desc, color=discord.Color.blue())
-                    await msg.edit(embed=embed)
+                    await db.execute("DELETE FROM events WHERE message_id = ?", (msg_id,))
+                    await db.execute("DELETE FROM attendances WHERE message_id = ?", (msg_id,))
+                    await db.commit()
 
         except Exception as e:
             if "disconnected" not in str(e).lower() and "closed" not in str(e).lower():
-                logging.getLogger("discord").error(f"Error in update_attendance_panels: {e}")
+                logging.getLogger("discord").error(f"Error in cleanup_past_events: {e}")
 
-    @update_attendance_panels.before_loop
-    async def before_update_attendance(self):
-        await self.wait_until_ready()
-
-    @tasks.loop(seconds=5.0)
-    async def update_room_panels(self):
-        """部屋状況パネルのバッチ更新（全サーバー対応）"""
-        try:
-            async with Database.connect() as db:
-                async with await db.execute("SELECT guild_id, message_id FROM room_panel") as cursor:
-                    panels = await cursor.fetchall()
-
-            for guild_id, msg_id in panels:
-                if guild_id is None:
-                    continue
-                settings = await get_guild_settings(guild_id)
-                if not settings or not settings.get("room_status_channel_id"):
-                    continue
-                room_channel = self.get_channel(settings["room_status_channel_id"])
-                if not room_channel:
-                    continue
-                try:
-                    msg = await room_channel.fetch_message(msg_id)
-                except (discord.NotFound, discord.HTTPException):
-                    continue
-
-                async with Database.connect() as db:
-                    async with await db.execute(
-                        "SELECT name, is_open, last_updated FROM rooms WHERE guild_id = ? ORDER BY name", (guild_id,)
-                    ) as cursor:
-                        rooms = await cursor.fetchall()
-
-                desc = ""
-                if not rooms:
-                    desc = "登録されている部屋がありません。"
-                else:
-                    for room in rooms:
-                        rname, is_open, last_updated = room
-                        status_emoji = "🟢" if is_open else "🔴"
-                        status_text = "開放中" if is_open else "施錠中"
-                        desc += f"{status_emoji} **{rname}** : {status_text} (更新: {last_updated})\n"
-
-                current_desc = msg.embeds[0].description if msg.embeds else ""
-                if current_desc != desc:
-                    embed = discord.Embed(title="🏢 部室・施設の利用状況", description=desc, color=discord.Color.green())
-                    view = RoomStatusView(rooms)
-                    await msg.edit(embed=embed, view=view)
-
-        except Exception as e:
-            if "disconnected" not in str(e).lower() and "closed" not in str(e).lower():
-                logging.getLogger("discord").error(f"Error in update_room_panels: {e}")
-
-    @update_room_panels.before_loop
-    async def before_update_rooms(self):
+    @cleanup_past_events.before_loop
+    async def before_cleanup(self):
         await self.wait_until_ready()
 
 
