@@ -4,8 +4,8 @@ import logging
 
 class RequestCircuitBreaker:
     """Discord APIへの過剰通信（連打・ループ）を瞬時に検知し、API送信前に事前遮断するクラス"""
-    def __init__(self, max_requests: int = 15, window_seconds: float = 5.0, cooldown_seconds: float = 60.0):
-        self.max_requests = max_requests  # 5秒間に最大15リクエストまで許可
+    def __init__(self, max_requests: int = 10, window_seconds: float = 5.0, cooldown_seconds: float = 60.0):
+        self.max_requests = max_requests  # 5秒間に最大10リクエストまで許可 (より安全なマージン)
         self.window_seconds = window_seconds
         self.cooldown_seconds = cooldown_seconds
         self._timestamps = []
