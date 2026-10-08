@@ -949,26 +949,5 @@ if __name__ == "__main__":
     if not TOKEN:
         print("エラー: .env ファイルに DISCORD_TOKEN または DISCORD_BOT_TOKEN が設定されていません。", flush=True)
     else:
-        initial_backoff = 30
-        max_backoff = 300
-        backoff = initial_backoff
-
-        while True:
-            try:
-                print("トークンを読み込みました。Discordサーバーへ接続中...", flush=True)
-                bot.run(TOKEN)
-                break
-            except discord.errors.HTTPException as e:
-                if e.status == 429:
-                    print(
-                        f"⚠️ [Rate Limited / 429] レートリミットを検知しました。{backoff}秒待機します: {e}",
-                        flush=True,
-                    )
-                else:
-                    print(f"⚠️ [HTTP {e.status}] HTTPエラー: {e}。{backoff}秒待機します。", flush=True)
-            except Exception as e:
-                print(f"⚠️ [Error] 接続エラーまたは例外: {e}。{backoff}秒待機します。", flush=True)
-
-            print(f"🔄 再接続待機中 ({backoff}秒)...", flush=True)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, max_backoff)
+        print("トークンを読み込みました。Discordサーバーへ接続中...", flush=True)
+        bot.run(TOKEN)
