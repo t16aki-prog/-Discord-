@@ -99,22 +99,28 @@ class Database:
 
     async def execute(self, sql, params=()):
         if self._is_turso:
-            try:
-                rs = await self._client.execute(sql, list(params))
-                return LibsqlCursorWrapper(rs)
-            except Exception as e:
-                print(f"Tursoクエリエラー: {e}", flush=True)
-                # サーバー切断エラーの場合、次回再接続するために共有クライアントを破棄
-                if "disconnected" in str(e).lower() or "closed" in str(e).lower():
-                    global _turso_shared_client
-                    if _turso_shared_client is not None:
-                        try:
-                            await _turso_shared_client.close()
-                        except:
-                            pass
-                        _turso_shared_client = None
-                    print("Tursoへの接続が切断されました。クライアントをリセットし、次回再接続します。", flush=True)
-                raise e
+            global _turso_shared_client
+            for attempt in range(2):
+                try:
+                    rs = await self._client.execute(sql, list(params))
+                    return LibsqlCursorWrapper(rs)
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if attempt == 0 and ("disconnected" in err_msg or "closed" in err_msg or "reset" in err_msg):
+                        if _turso_shared_client is not None:
+                            try:
+                                await _turso_shared_client.close()
+                            except Exception:
+                                pass
+                            _turso_shared_client = None
+                        import libsql_client
+                        _turso_shared_client = libsql_client.create_client(
+                            url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN
+                        )
+                        self._client = _turso_shared_client
+                        continue
+                    print(f"Tursoクエリエラー: {e}", flush=True)
+                    raise e
         else:
             return await self._conn.execute(sql, params)
 
@@ -642,6 +648,7 @@ class CircleManagerBot(commands.Bot):
         intents = discord.Intents.default()
         intents.guild_scheduled_events = True
         super().__init__(command_prefix="!", intents=intents)
+        self._ensured_guild_ids = set()
 
     async def setup_hook(self):
         await init_db()
@@ -652,20 +659,26 @@ class CircleManagerBot(commands.Bot):
         self.add_view(AttendanceView())
 
         # 部屋パネルのViewを全サーバー分登録
-        async with Database.connect() as db:
-            async with await db.execute("SELECT DISTINCT guild_id FROM rooms") as cursor:
-                guild_rows = await cursor.fetchall()
-        for (gid,) in guild_rows:
+        try:
             async with Database.connect() as db:
-                async with await db.execute(
-                    "SELECT name, is_open FROM rooms WHERE guild_id = ? ORDER BY name", (gid,)
-                ) as cursor:
-                    rooms = await cursor.fetchall()
-            self.add_view(RoomStatusView(rooms))
+                async with await db.execute("SELECT DISTINCT guild_id FROM rooms") as cursor:
+                    guild_rows = await cursor.fetchall()
+            for (gid,) in guild_rows:
+                async with Database.connect() as db:
+                    async with await db.execute(
+                        "SELECT name, is_open FROM rooms WHERE guild_id = ? ORDER BY name", (gid,)
+                    ) as cursor:
+                        rooms = await cursor.fetchall()
+                self.add_view(RoomStatusView(rooms))
+        except Exception as e:
+            logging.getLogger("discord").error(f"部屋パネルViewの初期化エラー: {e}")
 
-        # スラッシュコマンドの同期
-        synced = await self.tree.sync()
-        print(f"スラッシュコマンドを {len(synced)} 件同期しました。", flush=True)
+        # スラッシュコマンドの同期（レートリミット等の例外でBotが落ちないよう保護）
+        try:
+            synced = await self.tree.sync()
+            print(f"スラッシュコマンドを {len(synced)} 件同期しました。", flush=True)
+        except Exception as e:
+            print(f"スラッシュコマンド同期スキップ（一時制限またはエラー）: {e}", flush=True)
 
         # 過去イベントの定期クリーンアップタスク開始（10分おき）
         self.cleanup_past_events.start()
@@ -715,6 +728,8 @@ class CircleManagerBot(commands.Bot):
 
     async def _ensure_admin_panel(self, guild: discord.Guild):
         """指定サーバーの管理チャンネルに管理パネルが存在しなければ自動設置する"""
+        if guild.id in self._ensured_guild_ids:
+            return
         logger = logging.getLogger("discord")
         settings = await get_guild_settings(guild.id)
         if not settings or not settings.get("admin_channel_id"):
@@ -727,22 +742,23 @@ class CircleManagerBot(commands.Bot):
             logger.error(f"管理チャンネル取得失敗 ({guild.name}): {e}")
             return
         panel_found = False
-        async for message in admin_channel.history(limit=50):
-            if message.author == self.user and message.embeds:
-                if message.embeds[0].title == "⚙️ Bot管理パネル":
-                    panel_found = True
-                    break
-        if not panel_found:
-            embed = discord.Embed(
-                title="⚙️ Bot管理パネル",
-                description="以下のボタンをクリックして操作してください。\n※このメッセージを削除してしまった場合は、Botを再起動すると再設置されます。",
-                color=discord.Color.dark_theme(),
-            )
-            try:
+        try:
+            async for message in admin_channel.history(limit=15):
+                if message.author == self.user and message.embeds:
+                    if message.embeds[0].title == "⚙️ Bot管理パネル":
+                        panel_found = True
+                        break
+            if not panel_found:
+                embed = discord.Embed(
+                    title="⚙️ Bot管理パネル",
+                    description="以下のボタンをクリックして操作してください。\n※このメッセージを削除してしまった場合は、Botを再起動すると再設置されます。",
+                    color=discord.Color.dark_theme(),
+                )
                 await admin_channel.send(embed=embed, view=AdminPanelView())
                 logger.info(f"[{guild.name}] 管理パネルを設置しました。")
-            except Exception as e:
-                logger.error(f"[{guild.name}] 管理パネル送信失敗: {e}")
+            self._ensured_guild_ids.add(guild.id)
+        except Exception as e:
+            logger.error(f"[{guild.name}] 管理パネル確認・送信失敗: {e}")
 
     @tasks.loop(minutes=10.0)
     async def cleanup_past_events(self):
