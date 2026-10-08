@@ -10,6 +10,7 @@ import asyncio
 from dotenv import load_dotenv
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import time
 import aiohttp
 from aiohttp import web
 
@@ -700,6 +701,7 @@ class CircleManagerBot(commands.Bot):
 
     async def setup_hook(self):
         await init_db()
+        asyncio.create_task(start_web_server())
 
         # 永続Viewの登録（再起動後もボタンが機能するよう）
         self.add_view(AdminPanelView())
@@ -925,58 +927,35 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
         await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
 
 
-# --- 指数バックオフ付きメインエントリーポイント ---
-
-async def main():
-    # 1. ヘルスチェック用Webサーバーを最優先で起動 (Renderのヘルスチェック死・クラッシュループを防ぐ)
-    await start_web_server()
-
-    if not TOKEN:
-        print("エラー: .env ファイルに DISCORD_TOKEN または DISCORD_BOT_TOKEN が設定されていません。", flush=True)
-        return
-
-    # 2. 指数バックオフ付きの接続リトライループ
-    initial_backoff = 30    # 初期待機: 30秒
-    max_backoff = 300       # 最大待機: 300秒 (5分)
-    backoff = initial_backoff
-
-    while True:
-        try:
-            print("Discordサーバーへ接続中...", flush=True)
-            await bot.start(TOKEN)
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                print(
-                    f"⚠️ [Rate Limited / 429 / Cloudflare Error 1015] レートリミットを検知しました。\n"
-                    f"   ブロック解除のため {backoff} 秒間リクエストを完全に停止して待機します。\n"
-                    f"   詳細: {e}",
-                    flush=True,
-                )
-            else:
-                print(f"⚠️ [HTTP {e.status}] HTTPエラーが発生しました: {e}。{backoff}秒待機します。", flush=True)
-        except (discord.errors.GatewayNotFound, discord.errors.ConnectionClosed, aiohttp.ClientError, OSError) as e:
-            print(f"⚠️ [Network Error] 接続エラーが発生しました: {e}。{backoff}秒待機します。", flush=True)
-        except Exception as e:
-            print(f"⚠️ [Unexpected Error] 予期せぬエラーが発生しました: {e}。{backoff}秒待機します。", flush=True)
-        finally:
-            if not bot.is_closed():
-                try:
-                    await bot.close()
-                except Exception:
-                    pass
-
-        print(
-            f"🔄 クールダウン待機中 ({backoff}秒)... (Webサーバーは稼働中のためRenderによる強制再起動は防がれます)",
-            flush=True,
-        )
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, max_backoff)
-
+# --- メインエントリーポイント ---
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
     print("Botの起動処理を開始します...", flush=True)
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Botを停止しました。", flush=True)
+
+    if not TOKEN:
+        print("エラー: .env ファイルに DISCORD_TOKEN または DISCORD_BOT_TOKEN が設定されていません。", flush=True)
+    else:
+        initial_backoff = 30
+        max_backoff = 300
+        backoff = initial_backoff
+
+        while True:
+            try:
+                print("トークンを読み込みました。Discordサーバーへ接続中...", flush=True)
+                bot.run(TOKEN)
+                break
+            except discord.errors.HTTPException as e:
+                if e.status == 429:
+                    print(
+                        f"⚠️ [Rate Limited / 429] レートリミットを検知しました。{backoff}秒待機します: {e}",
+                        flush=True,
+                    )
+                else:
+                    print(f"⚠️ [HTTP {e.status}] HTTPエラー: {e}。{backoff}秒待機します。", flush=True)
+            except Exception as e:
+                print(f"⚠️ [Error] 接続エラーまたは例外: {e}。{backoff}秒待機します。", flush=True)
+
+            print(f"🔄 再接続待機中 ({backoff}秒)...", flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
