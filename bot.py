@@ -311,3 +311,33 @@ async def setup_error(interaction: discord.Interaction, error: app_commands.AppC
         )
     else:
         await interaction.response.send_message(f"エラーが発生しました: {error}", ephemeral=True)
+
+
+# --- グローバルエラーハンドラー ---
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """プレフィックスコマンドのエラーハンドリング"""
+    if isinstance(error, commands.CommandNotFound):
+        return  # 未登録のコマンドはサイレント無視
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("⚠️ このコマンドを実行する権限（管理者権限）がありません。")
+    else:
+        logging.getLogger("discord").error(f"コマンドエラー ({ctx.command}): {error}")
+        await ctx.send(f"⚠️ コマンド実行中にエラーが発生しました: {error}")
+
+
+@bot.tree.error
+async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """スラッシュコマンドのエラーハンドリング"""
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "⚠️ このコマンドを実行する権限がありません。"
+    else:
+        msg = f"⚠️ エラーが発生しました: {error}"
+        logging.getLogger("discord").error(f"スラッシュコマンドエラー: {error}")
+
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+

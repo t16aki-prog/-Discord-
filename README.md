@@ -1,66 +1,84 @@
-# サークル管理Bot 導入手順書
+# サークル管理Bot 総合導入・運用手順書
 
-このBotは、Discord上で「出欠確認」と「部室・施設の利用状況」を管理するためのシステムです。
-以下の手順に従って、ご自身のパソコンやサーバー（VPS等）に導入してください。
+このBotは、Discord上で **「出欠管理」** と **「部室・施設の利用状況」** を自動化・管理するためのマルチサーバー対応システムです。
+クラウド（Render + Turso DB）およびローカル環境での24時間安定稼働に対応しています。
 
 ---
 
 ## 1. 事前準備
-1. **Pythonのインストール**
-   Botを動かすために「Python 3.8 以上」が必要です。インストールされていない場合は公式サイトからダウンロードしてインストールしてください。
-2. **Discord Developer PortalでのBot作成**
-   - [Discord Developer Portal](https://discord.com/developers/applications) にアクセスし、新しいアプリケーションを作成します。
-   - 「Bot」タブからBotを作成し、**Token（トークン）** をコピーして控えておきます。
-   - 同じく「Bot」タブ内にある **Privileged Gateway Intents** のうち、以下の3つを必ず「ON」にしてください。
-     - Presence Intent
-     - Server Members Intent
-     - Message Content Intent
-3. **サーバーへの招待**
-   - 「OAuth2」->「URL Generator」にて、`bot` と `applications.commands` にチェックを入れます。
-   - Administrator（管理者権限）などの必要な権限を付与し、生成されたURLからBotを自分のサーバーに招待してください。
+
+1. **Discord Developer Portal での Bot 設定**
+   - [Discord Developer Portal](https://discord.com/developers/applications) にアクセスし、Botの **Token（トークン）** を取得します。
+   - 「Bot」タブの **Privileged Gateway Intents** で以下をすべて **ON** にしてください：
+     - ✅ **Presence Intent**
+     - ✅ **Server Members Intent**
+     - ✅ **Message Content Intent**
+2. **サーバーへの招待**
+   - 「OAuth2」->「URL Generator」にて、`bot` と `applications.commands` を選択。
+   - `Administrator`（管理者権限）を付与して生成されたURLからBotをサーバーに招待します。
 
 ---
 
 ## 2. 初期設定
 
-1. **必要なライブラリのインストール**
-   ターミナル（コマンドプロンプト）を開き、このフォルダ内で以下のコマンドを実行して必要なライブラリをインストールします。
+1. **ライブラリのインストール**
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **`.env` ファイルの作成と設定**
-   `.env.example` というファイルをコピーし、ファイル名を `.env` に変更してください。
-   中身をテキストエディタで開き、以下の情報を自分のサーバーに合わせて書き換えます。
+2. **`.env` ファイルの設定**
+   `.env.example` をコピーして `.env` を作成し、必要な環境変数を入力します：
 
    ```env
-   DISCORD_TOKEN=ここにコピーしたBotのトークンを貼り付ける
-   ADMIN_CHANNEL_ID=Botの管理パネルを設置するチャンネルのID
-   ATTENDANCE_CHANNEL_ID=出欠パネルを表示するチャンネルのID
-   ROOM_STATUS_CHANNEL_ID=部室状況パネルを表示するチャンネルのID
+   # Discord Bot トークン (必須)
+   DISCORD_TOKEN=your_bot_token_here
+
+   # Turso クラウドDB設定 (Render運用時は必須 / ローカル時は空欄でSQLite自動使用)
+   TURSO_DATABASE_URL=https://your-db-name.turso.io
+   TURSO_AUTH_TOKEN=your_turso_auth_token
+
+   # スラッシュコマンド初回同期フラグ (通常は false, コマンド追加時のみ true または !sync)
+   SYNC_COMMANDS=false
    ```
-   ※チャンネルIDは、Discordの設定から「開発者モード」をONにし、チャンネルを右クリックして「チャンネルIDをコピー」から取得できます。
 
 ---
 
-## 3. 起動と動作確認
+## 3. ディレクトリ構造
 
-1. **Botの起動**
-   ターミナルで以下のコマンドを実行します。
-   ```bash
-   python main.py
-   ```
-2. **自己修復機能の確認**
-   Botが起動すると、`ADMIN_CHANNEL_ID` に指定したチャンネルに自動的に「Bot管理パネル」が送信されます。
-
-3. **管理パネルの使い方**
-   - **「📅 本日のイベントから出欠」**: Discord標準の「イベント機能」で作られた今日の日付の予定を読み込み、出欠パネルを自動設置します。
-   - **「📝 手動で出欠作成」**: Discordイベント機能を使わず、その場で手入力してパネルを設置します。
-   - **「🏠 部屋を追加 / 🗑️ 部屋を削除」**: 状況管理したい部室や施設を登録・削除します。
-   - **「🔄 部屋パネルを再設置」**: 部室状況のパネルを設置・更新します。
+```text
+ディスコードBot/
+├── config.py              # 設定・環境変数の一括管理
+├── database.py            # Turso / SQLite 自動判別データベース層
+├── circuit_breaker.py     # 過剰リクエスト事前遮断 & 自己防衛システム
+├── web_server.py          # Render スリープ防止用 Web サーバー (ポート開放)
+├── ui/                    # ボタン・セレクト・モーダル等のUI部品
+│   ├── __init__.py
+│   ├── attendance.py      # 出欠パネル View
+│   ├── room_status.py     # 部室・施設状況 View / Modal
+│   └── admin_panel.py     # 管理パネル View & イベント作成Modal
+├── bot.py                 # Bot 本体クラス & コマンド定義
+└── main.py                # 超軽量エントリーポイント (起動スクリプト)
+```
 
 ---
 
-## 4. 24時間稼働させるには？
-個人のパソコンで動かす場合、パソコンの電源を切るとBotも止まってしまいます。
-常にBotを動かし続ける場合は、ConoHa VPSやXserver VPSなどのクラウドサーバー、またはRaspberry Piなどの小型PCを契約・用意し、そこにこのフォルダを配置して起動し続けることをおすすめします。
+## 4. コマンド一覧
+
+### 📌 スラッシュコマンド（一般設定）
+* **`/setup`** (管理者専用):
+  * 各種パネルを設置するチャンネル（管理、出欠、部室状況）を設定します。
+
+### 📌 管理者専用プレフィックスコマンド
+* **`!sync`**: スラッシュコマンドを手動で Discord 側に即時同期します。
+* **`!status`**: Bot の稼働状態、サーキットブレーカーの防衛状況、直近通信頻度を表示します。
+* **`!maintenance on` / `!maintenance off`**: メンテナンスモードの有効化・解除（一般ユーザーの操作受付を一時停止）。
+* **`!shutdown`** (または `!stop`): Discord 上から Bot を安全に切断・シャットダウンします。
+
+---
+
+## 5. 安全機能・自己防衛システム（Circuit Breaker）
+
+* **レートリミット事前遮断**: 
+  短時間（5秒間）に 10回以上 の操作を検知した場合、Cloudflare / Discord による IP ブロックを未然に防ぐため、Discord API に送る手前で自動的にリクエストを遮断し、60秒間クールダウンします。
+* **Render クラッシュループ防止**: 
+  起動直後に別スレッドでポート（`PORT`）を開放し、Render のヘルスチェックを瞬時にパスさせます。
